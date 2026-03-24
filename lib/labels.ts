@@ -1,5 +1,6 @@
 import { google } from "googleapis";
 import type { gmail_v1 } from "googleapis";
+import type { Account } from "./accounts";
 
 export interface LabelIds {
   toRespond: string;
@@ -19,33 +20,31 @@ const LABEL_COLORS: Record<
   keyof typeof LABEL_NAMES,
   { backgroundColor: string; textColor: string }
 > = {
-  toRespond: { backgroundColor: "#4a86e8", textColor: "#ffffff" }, // blue — action needed
-  fyi: { backgroundColor: "#16a765", textColor: "#ffffff" },       // green — informational
-  newsletter: { backgroundColor: "#ffad47", textColor: "#000000" }, // amber — marketing
-  noise: { backgroundColor: "#999999", textColor: "#ffffff" },     // gray — ignore
+  toRespond: { backgroundColor: "#4a86e8", textColor: "#ffffff" },
+  fyi: { backgroundColor: "#16a765", textColor: "#ffffff" },
+  newsletter: { backgroundColor: "#ffad47", textColor: "#000000" },
+  noise: { backgroundColor: "#999999", textColor: "#ffffff" },
 };
 
-let _gmail: gmail_v1.Gmail | null = null;
+const _clients = new Map<string, gmail_v1.Gmail>();
 
-function getGmailClient(): gmail_v1.Gmail {
-  if (!_gmail) {
+function getGmailClient(account?: Account): gmail_v1.Gmail {
+  const key = account?.id ?? "env-default";
+  if (!_clients.has(key)) {
     const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
+      account?.clientId ?? process.env.GOOGLE_CLIENT_ID,
+      account?.clientSecret ?? process.env.GOOGLE_CLIENT_SECRET
     );
-    auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-    _gmail = google.gmail({ version: "v1", auth });
+    auth.setCredentials({
+      refresh_token: account?.refreshToken ?? process.env.GOOGLE_REFRESH_TOKEN,
+    });
+    _clients.set(key, google.gmail({ version: "v1", auth }));
   }
-  return _gmail;
+  return _clients.get(key)!;
 }
 
-/**
- * Ensures all 4 AI Inbox labels exist in Gmail.
- * Creates them on first run with distinct emoji names and colors.
- * Idempotent — safe to call on every scan.
- */
-export async function ensureLabelsExist(): Promise<LabelIds> {
-  const gmail = getGmailClient();
+export async function ensureLabelsExist(account?: Account): Promise<LabelIds> {
+  const gmail = getGmailClient(account);
   const res = await gmail.users.labels.list({ userId: "me" });
   const existing = res.data.labels ?? [];
 

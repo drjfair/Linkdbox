@@ -7,6 +7,7 @@ import {
 } from "@/lib/gmail";
 import { classifyEmail } from "@/lib/ai/classify";
 import { generateDraftReply } from "@/lib/ai/draft";
+import { getAccount, type Account } from "@/lib/accounts";
 
 export interface ScanResult {
   processed: number;
@@ -26,8 +27,9 @@ export interface ScanResult {
  *   3. Apply the label immediately (prevents reprocessing even if draft fails)
  *   4. If TO_RESPOND, generate a draft reply and save it to Gmail Drafts
  */
-export async function runScan(): Promise<ScanResult> {
+export async function runScan(accountId?: string): Promise<ScanResult> {
   const startTime = Date.now();
+  const account: Account | undefined = accountId ? getAccount(accountId) : undefined;
   const errors: Array<{ threadId: string; error: string }> = [];
   const labelCounts: Record<string, number> = {
     TO_RESPOND: 0,
@@ -39,16 +41,14 @@ export async function runScan(): Promise<ScanResult> {
   let draftsCreated = 0;
 
   // Ensure our 4 AI labels exist in Gmail (creates them on first run)
-  const labelIds = await ensureLabelsExist();
+  const labelIds = await ensureLabelsExist(account);
 
   // Find emails that haven't been processed yet
-  const threadIds = await getUnprocessedThreadIds(labelIds);
+  const threadIds = await getUnprocessedThreadIds(labelIds, account);
 
-  // Process sequentially — avoids Gmail rate limits and is naturally
-  // throttled by AI API latency (~1-3 seconds per thread)
   for (const threadId of threadIds) {
     try {
-      const thread = await getFullThread(threadId);
+      const thread = await getFullThread(threadId, account);
       const classification = await classifyEmail(thread);
 
       // Map classification label to Gmail label ID
@@ -62,14 +62,14 @@ export async function runScan(): Promise<ScanResult> {
 
       // Apply label immediately — if draft generation fails below,
       // the email still has a label and won't be reprocessed
-      await applyLabel(threadId, gmailLabelId);
+      await applyLabel(threadId, gmailLabelId, account);
       labelCounts[classification.label]++;
       processed++;
 
       // Generate and save a draft reply for TO_RESPOND emails
       if (classification.label === "TO_RESPOND") {
         const draftBody = await generateDraftReply(thread);
-        await createDraft(thread, draftBody);
+        await createDraft(thread, draftBody, account);
         draftsCreated++;
       }
     } catch (err) {

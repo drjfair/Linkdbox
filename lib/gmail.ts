@@ -1,14 +1,15 @@
 import { google } from "googleapis";
 import type { gmail_v1 } from "googleapis";
+import type { Account } from "./accounts";
 
 export interface EmailMessage {
-  messageId: string; // The RFC 2822 Message-ID header (for threading)
-  gmailId: string;   // Gmail's internal message ID
+  messageId: string;
+  gmailId: string;
   from: string;
   to: string;
   subject: string;
   date: string;
-  body: string; // plain text, decoded
+  body: string;
 }
 
 export interface EmailThread {
@@ -23,32 +24,35 @@ export interface EmailSummary {
   from: string;
   date: string;
   snippet: string;
+  accountId?: string;
 }
 
-let _gmail: gmail_v1.Gmail | null = null;
+// Cache Gmail clients per account
+const _clients = new Map<string, gmail_v1.Gmail>();
 
-function getGmailClient(): gmail_v1.Gmail {
-  if (!_gmail) {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-    auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-    _gmail = google.gmail({ version: "v1", auth });
+function getGmailClient(account?: Account): gmail_v1.Gmail {
+  const key = account?.id ?? "env-default";
+
+  if (!_clients.has(key)) {
+    const clientId = account?.clientId ?? process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = account?.clientSecret ?? process.env.GOOGLE_CLIENT_SECRET;
+    const refreshToken = account?.refreshToken ?? process.env.GOOGLE_REFRESH_TOKEN;
+
+    if (!refreshToken) throw new Error("No refresh token — run the auth script");
+
+    const auth = new google.auth.OAuth2(clientId, clientSecret);
+    auth.setCredentials({ refresh_token: refreshToken });
+    _clients.set(key, google.gmail({ version: "v1", auth }));
   }
-  return _gmail;
+
+  return _clients.get(key)!;
 }
 
-/**
- * Returns thread IDs for emails in the inbox that don't have any of our AI labels.
- */
-export async function getUnprocessedThreadIds(labelIds: {
-  toRespond: string;
-  fyi: string;
-  newsletter: string;
-  noise: string;
-}): Promise<string[]> {
-  const gmail = getGmailClient();
+export async function getUnprocessedThreadIds(
+  labelIds: { toRespond: string; fyi: string; newsletter: string; noise: string },
+  account?: Account
+): Promise<string[]> {
+  const gmail = getGmailClient(account);
   const query = [
     "in:inbox",
     `-label:"AI Inbox/✍️ Draft Ready"`,
@@ -72,48 +76,38 @@ export async function getUnprocessedThreadIds(labelIds: {
     threadIds.push(...threads.map((t) => t.id!).filter(Boolean));
     pageToken = res.data.nextPageToken ?? undefined;
 
-    // Cap at 50 threads per scan run to stay within timeouts
     if (threadIds.length >= 50) break;
   } while (pageToken);
 
   return threadIds.slice(0, 50);
 }
 
-/**
- * Fetches all messages in a thread, sorted oldest-first.
- * Extracts plain text body, decoding from base64url.
- */
-export async function getFullThread(threadId: string): Promise<EmailThread> {
-  const gmail = getGmailClient();
+export async function getFullThread(
+  threadId: string,
+  account?: Account
+): Promise<EmailThread> {
+  const gmail = getGmailClient(account);
   const res = await gmail.users.threads.get({
     userId: "me",
     id: threadId,
     format: "full",
   });
 
-  const messages = (res.data.messages ?? []).map((msg) =>
-    parseMessage(msg)
-  );
-
-  // Sort oldest-first
+  const messages = (res.data.messages ?? []).map((msg) => parseMessage(msg));
   messages.sort(
     (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
   );
 
-  const subject =
-    messages[0]?.subject ?? "(no subject)";
-
+  const subject = messages[0]?.subject ?? "(no subject)";
   return { threadId, subject, messages };
 }
 
-/**
- * Applies a label to a thread.
- */
 export async function applyLabel(
   threadId: string,
-  labelId: string
+  labelId: string,
+  account?: Account
 ): Promise<void> {
-  const gmail = getGmailClient();
+  const gmail = getGmailClient(account);
   await gmail.users.threads.modify({
     userId: "me",
     id: threadId,
@@ -121,23 +115,18 @@ export async function applyLabel(
   });
 }
 
-/**
- * Creates a Gmail draft as a reply to the last message in a thread.
- * Sets proper In-Reply-To / References headers so it threads correctly.
- */
 export async function createDraft(
   thread: EmailThread,
-  replyBody: string
+  replyBody: string,
+  account?: Account
 ): Promise<void> {
-  const gmail = getGmailClient();
+  const gmail = getGmailClient(account);
   const lastMessage = thread.messages[thread.messages.length - 1];
 
-  // Build reply headers
   const subject = thread.subject.startsWith("Re:")
     ? thread.subject
     : `Re: ${thread.subject}`;
 
-  // Collect all Message-IDs for References header
   const allMessageIds = thread.messages
     .map((m) => m.messageId)
     .filter(Boolean)
@@ -162,22 +151,17 @@ export async function createDraft(
   await gmail.users.drafts.create({
     userId: "me",
     requestBody: {
-      message: {
-        raw: encoded,
-        threadId: thread.threadId,
-      },
+      message: { raw: encoded, threadId: thread.threadId },
     },
   });
 }
 
-/**
- * Lists threads with a given label, returning lightweight summaries for the dashboard.
- */
 export async function listLabeledThreads(
   labelId: string,
+  account?: Account,
   maxResults = 20
 ): Promise<EmailSummary[]> {
-  const gmail = getGmailClient();
+  const gmail = getGmailClient(account);
 
   const res = await gmail.users.threads.list({
     userId: "me",
@@ -188,7 +172,6 @@ export async function listLabeledThreads(
   const threads = res.data.threads ?? [];
   if (threads.length === 0) return [];
 
-  // Fetch metadata for each thread in parallel
   const summaries = await Promise.all(
     threads.map(async (t) => {
       try {
@@ -210,6 +193,7 @@ export async function listLabeledThreads(
           from: get("From"),
           date: get("Date"),
           snippet: firstMsg?.snippet ?? "",
+          accountId: account?.id ?? "env-default",
         } satisfies EmailSummary;
       } catch {
         return null;
@@ -218,6 +202,12 @@ export async function listLabeledThreads(
   );
 
   return summaries.filter((s): s is EmailSummary => s !== null);
+}
+
+export async function getAccountEmail(account?: Account): Promise<string> {
+  const gmail = getGmailClient(account);
+  const res = await gmail.users.getProfile({ userId: "me" });
+  return res.data.emailAddress ?? "";
 }
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
@@ -244,18 +234,15 @@ function extractPlainText(
 ): string {
   if (!payload) return "";
 
-  // Direct body (no parts)
   if (payload.mimeType === "text/plain" && payload.body?.data) {
     return Buffer.from(payload.body.data, "base64url").toString("utf-8");
   }
 
-  // HTML fallback if no plain text at this level
   if (payload.mimeType === "text/html" && payload.body?.data) {
     const html = Buffer.from(payload.body.data, "base64url").toString("utf-8");
     return stripHtml(html);
   }
 
-  // Recurse into parts — prefer text/plain over text/html
   const parts = payload.parts ?? [];
   const plainPart = parts.find((p) => p.mimeType === "text/plain");
   if (plainPart) return extractPlainText(plainPart);
@@ -263,7 +250,6 @@ function extractPlainText(
   const htmlPart = parts.find((p) => p.mimeType === "text/html");
   if (htmlPart) return extractPlainText(htmlPart);
 
-  // Recurse into multipart containers
   for (const part of parts) {
     if (part.mimeType?.startsWith("multipart/")) {
       const text = extractPlainText(part);
